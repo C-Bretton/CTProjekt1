@@ -56,15 +56,18 @@ try:
         if distance < 18:
             GPIO.output(LED, True)
             temp = False        
+            time.sleep(0.1)
         elif distance < 30:
             GPIO.output(LED, temp)
             temp = not temp
+            time.sleep(1)
         else:
             GPIO.output(LED, False)
             temp = True
+            time.sleep(1)
         
         
-        time.sleep(1)
+        
 
 except KeyboardInterrupt:
     print("Stop")
