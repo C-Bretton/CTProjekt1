@@ -5,6 +5,7 @@ This project's goal was to code TurtleBot3 burger to navigate through an obstacl
 
 The code implemented can be found in the project folder.
 
-Made by
+
+Made by 
 
 Christian Bretton Nielsen & Asser Kaas Andersen
