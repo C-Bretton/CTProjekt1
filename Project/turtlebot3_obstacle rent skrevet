@@ -1,0 +1,262 @@
+#!/usr/bin/env python
+#################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#################################################################################
+
+# Originil authors: Gilbert #
+# Edited for computer engineering project I by: Christian Bretton Nielsen and Asser Kaas Andersen #
+
+
+import rospy
+import math
+import smbus
+import time
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+
+# Global variables for speed and distance conditions
+LINEAR_VEL = 0.22
+STOP_DISTANCE = 0.10
+LIDAR_ERROR = 0.05
+SAFE_STOP_DISTANCE = STOP_DISTANCE + LIDAR_ERROR
+SAFE_TURN_DISTANCE = SAFE_STOP_DISTANCE * 2
+
+# Class for lightsensor. Inspired by code provided in week 3
+class LightSensor():
+    # Initialising the sensor
+    def __init__(self):
+        # Get I2C bus
+        self.bus = smbus.SMBus(1)
+
+        # ISL29125 address, 0x44(68)
+        # Select configuation-1register, 0x01(01)
+        # 0x0D(13) Operation: RGB, Range: 360 lux, Res: 16 Bits
+        self.bus.write_byte_data(0x44, 0x01, 0x05)
+        
+    # Function gathering RGB data form the sensor
+    def getAndUpdateColour(self):
+        # Read the data from the sensor
+        data = self.bus.read_i2c_block_data(0x44, 0x09, 6)
+        
+        # Assigning the data to their corresponding colours
+        green = data[1]
+        red = data[3]
+        blue = data[5]
+        
+        return (red, green, blue)
+
+# Class used for navigation
+class Obstacle():
+    def __init__(self):
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self.obstacle()
+    
+    # Function used to define range of LiDAR sensor
+    def get_scan(self, angle):
+        scan = rospy.wait_for_message('scan', LaserScan)
+        scan_filter = []
+       
+        samples = len(scan.ranges)  # The number of samples is defined in 
+                                    # turtlebot3_<model>.gazebo.xacro file,
+                                    # the default is 360.
+        samples_view = angle        # 1 <= samples_view <= samples
+        
+        if samples_view > samples:
+            samples_view = samples
+
+        
+        if samples_view is 1:
+            scan_filter.append(scan.ranges[0])
+	   
+        # Statement splitting the range equally on each side of the center (legacy)
+        else:
+            left_lidar_samples_ranges = -(samples_view//2 + samples_view % 2)
+            right_lidar_samples_ranges = samples_view//2
+
+            left_lidar_samples = scan.ranges[left_lidar_samples_ranges:]
+            right_lidar_samples = scan.ranges[:right_lidar_samples_ranges]
+            scan_filter.extend(left_lidar_samples + right_lidar_samples)
+
+        # Loop "fixing" blindspots and errors with sensor
+        for i in range(samples_view):
+            if scan_filter[i] == 0.0:
+                scan_filter[i] = 3.5
+            elif scan_filter[i] == float('Inf'):
+                scan_filter[i] = 3.5
+            elif math.isnan(scan_filter[i]):
+                scan_filter[i] = 3.5
+
+        return scan_filter
+
+    # Function detecting collisions. Collsion within 10cm all around the robot
+    def collision_check(self):
+        COLLISION_DISTANCE = 0.10
+        Collision_Scan = self.get_scan(360) 
+        
+        if min(Collision_Scan) < COLLISION_DISTANCE:
+            return True
+        else:
+            return False
+    
+    # Navigation function 
+    def obstacle(self):
+        # Intialisation of values
+        twist = Twist()
+        turtlebot_moving = True
+        collision_counter = 0
+        collison_cooldown = 0
+        RGB = LightSensor()
+        RGB_cooldown = 0
+        Rotation_counter = 4
+        victims_rescued = 0
+        accum_velocity = 0
+        speed_updates = 0
+        start_time = time.time()
+        run_time = 120 # 120 seconds amounting to 2 min
+
+        while (not rospy.is_shutdown() and (time.time() < start_time + run_time)): 
+            
+            # Collision checking
+            if self.collision_check() == True and collison_cooldown <= 0:
+                collision_counter += 1
+                collison_cooldown = 5
+                rospy.loginfo('Collision Detected, total collisions: %f', collision_counter)
+            collison_cooldown -= 1
+            
+            # Victim checking
+            RGB_data = RGB.getAndUpdateColour()
+            if RGB_cooldown <= 0:
+                if RGB_data[0] > 42:
+                    victims_rescued += 1
+                    RGB_cooldown = 7
+                    rospy.loginfo("Found victim, total victims found are: %f", victims_rescued)
+            else:
+                RGB_cooldown -= 1
+            
+            # Distance scans 
+            lidar_distances = self.get_scan(180)
+            # Defining range in front of the LiDAR sensor
+            front_cone = lidar_distances[58:118]
+
+            # Defining minimum distance as the smallest value in the array
+            min_distance = min(front_cone) 
+            # Defining index of minimum distance
+            min_index = front_cone.index(min_distance)
+            
+            # Statement deciding direction and sharpness of turn 
+            if min_index <= (len(front_cone)/2): # Decide which side the obstacle is on
+                TURN = 1*(0.5*(front_cone.index(min_distance)+1)) # The higher the index, the sharper the turn
+            else:
+                TURN = -1*(0.5*((len(front_cone)-front_cone.index(min_distance))+1)) # The higher the index, the blunter the turn
+
+
+            # Case with the turtlebot moving
+            if turtlebot_moving:
+                
+                # No obstacle in sight, go forward
+                if min_distance > SAFE_TURN_DISTANCE*1.5:
+                    twist.linear.x = LINEAR_VEL
+                    twist.angular.z = 0.0
+                    turtlebot_moving = True
+                    Rotation_counter = 4
+                    rospy.loginfo('Forward')
+                    
+                # Obstacle within SAFE_TURN_DISTANCE, begin to turn
+                elif min_distance > SAFE_STOP_DISTANCE*1.5:
+                    twist.linear.x = LINEAR_VEL 
+                    twist.angular.z = TURN
+                    turtlebot_moving = True
+                    Rotation_counter = 4
+                    rospy.loginfo('Forward TURN')
+                
+                # Obstacle within SAFE_STOP_DISTANCE, reverse
+                elif min_distance < SAFE_STOP_DISTANCE*1.5:
+                    twist.linear.x = -0.15
+                    twist.angular.z = 0.0
+                    turtlebot_moving = False
+                    Rotation_counter = 4
+                    rospy.loginfo('Stop!')
+                    
+            # Case where TurtleBot has stopped, i.e. turtlebot_moving = false
+            else:
+                # No obstacle in sight, go forward
+                if min(front_cone) >= SAFE_TURN_DISTANCE:
+                    twist.linear.x = LINEAR_VEL
+                    twist.angular.z = 0
+                    turtlebot_moving = True
+                    Rotation_counter = 4
+                    rospy.loginfo('Forward')
+                
+                # Obstacle within SAFE_TURN-DISTANCE, go forward and turn slightly
+                elif min(front_cone) >= SAFE_STOP_DISTANCE*1.5:
+                    twist.linear.x = LINEAR_VEL*0.8
+                    twist.angular.z = TURN*0.5 
+                    turtlebot_moving = False 
+                    Rotation_counter = 4
+                    rospy.loginfo('Slow - Turning')  
+                
+                # Surrounded by obstacles, perhaps dead end. Avoiding "wiggling" by restricting amount of turns it can make
+                else:
+                    # Defining minimum distance to an obstacle within 180 degrees in front of the robot
+                    min_distance = min(lidar_distances)
+                    # Defining the index with the minimum distance
+                    min_index = lidar_distances.index(min_distance)  
+                    
+                    # If there haven't been too many turns, define direction of turn
+                    if Rotation_counter > 0:
+                        if min_index <= (len(lidar_distances)/2): 
+                            STOP_TURN = 1
+                        else:
+                            STOP_TURN = -1
+                    
+                    # Otherwise continue with the last direction of the turn
+                    Rotation_counter -= 1
+                    twist.linear.x = 0.0
+                    twist.angular.z = STOP_TURN
+                    turtlebot_moving = False 
+                    rospy.loginfo('Stop - Turning')
+                
+            # Publishing linear and angular speed
+            self._cmd_pub.publish(twist)
+            
+            # DEBUGGING
+            # rospy.loginfo('Velocity : %f', twist.linear.x)
+            # rospy.loginfo('Turning Angle : %f', twist.angular.z)            
+            # rospy.loginfo('Obstacle is in angle_index: %f', obstacle_index)
+            # rospy.loginfo('Distance to the obstacle : %f', min_distance)
+            # rospy.loginfo("Colors are: %f, %f, %f", RGB_data[0], RGB_data[1], RGB_data[2])
+            
+            # Collecting data of the linear velocity
+            accum_velocity += abs(twist.linear.x)
+            speed_updates += 1
+        
+        # Printing the data of the run  
+        rospy.loginfo('***Overview of the run***')
+        rospy.loginfo('Run time: %f', time.time()-start_time)
+        rospy.loginfo('Average Velocity: %f', accum_velocity/speed_updates)
+        rospy.loginfo('Total Collisions: %f', collision_counter)
+        rospy.loginfo('Total Victims rescued: %f', victims_rescued)
+            
+
+def main():
+    rospy.init_node('turtlebot3_obstacle')
+    try:
+        obstacle = Obstacle()
+    except rospy.ROSInterruptException:
+        pass
+    
+if __name__ == '__main__':
+    main()
+
